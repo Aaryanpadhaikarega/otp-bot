@@ -120,7 +120,11 @@ def has_email_access(uid: int, email_addr: str) -> bool:
 
 # ================= EMAIL =================
 
-NETFLIX_OTP_PATTERN = re.compile(r"\b\d{4}\b")
+NETFLIX_OTP_PATTERN = re.compile(
+    r"Enter this code to sign in\s*[:\-\n]?\s*(\d{4})",
+    re.IGNORECASE
+)
+
 
 
 def fetch_signin_code(acc: Account) -> List[str]:
