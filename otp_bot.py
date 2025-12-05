@@ -1,22 +1,22 @@
-import telebot
-import psycopg2
-import re
 import os
-import datetime
-from flask import Flask
-from threading import Thread
+import re
+import psycopg2
+import imaplib
+import poplib
+import email
+from datetime import datetime, timedelta
+import telebot
+from flask import Flask, request
 
-# ========================= CONFIG =========================
-
+# ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-DB_URL = os.getenv("DB_URL")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DB_URL = os.getenv("DATABASE_URL")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# ========================= DB CONNECTION =========================
-
+# ================ DB ====================
 def get_db():
     return psycopg2.connect(DB_URL, sslmode="require")
 
@@ -25,204 +25,209 @@ def init_db():
     cur = con.cursor()
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS approved_users (
-            user_id BIGINT PRIMARY KEY
-        )
+    CREATE TABLE IF NOT EXISTS accounts (
+        email TEXT PRIMARY KEY,
+        password TEXT,
+        protocol TEXT,
+        server TEXT,
+        port INTEGER
+    )
     """)
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS granted_emails (
-            user_id BIGINT,
-            email TEXT,
-            expiry TIMESTAMP
-        )
+    CREATE TABLE IF NOT EXISTS approved_users (
+        user_id BIGINT PRIMARY KEY
+    )
     """)
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS otps (
-            email TEXT,
-            otp TEXT,
-            time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+    CREATE TABLE IF NOT EXISTS grants (
+        user_id BIGINT,
+        email TEXT,
+        expires_at TIMESTAMP
+    )
     """)
 
     con.commit()
     con.close()
 
-# ========================= FLASK KEEP ALIVE =========================
-
-@app.route("/")
-def home():
-    return "Bot Running"
-
-def run_flask():
-    app.run(host="0.0.0.0", port=10000)
-
-Thread(target=run_flask).start()
-
-# ========================= HELPERS =========================
-
-def is_admin(uid):
-    return uid == ADMIN_ID
+# ============ HELPERS =================
+def is_admin(uid): return uid == ADMIN_ID
 
 def is_approved(uid):
+    if is_admin(uid):
+        return True
     con = get_db()
     cur = con.cursor()
     cur.execute("SELECT 1 FROM approved_users WHERE user_id=%s", (uid,))
-    result = cur.fetchone()
+    ok = cur.fetchone()
     con.close()
-    return result is not None
+    return ok is not None
 
-def has_email_access(uid, email):
+def has_access(uid, email_addr):
+    if is_admin(uid):
+        return True
+
     con = get_db()
     cur = con.cursor()
     cur.execute("""
-        SELECT expiry FROM granted_emails 
-        WHERE user_id=%s AND email=%s
-    """, (uid, email))
-    row = cur.fetchone()
+    SELECT 1 FROM grants 
+    WHERE user_id=%s AND email=%s AND expires_at > NOW()
+    """, (uid, email_addr))
+    ok = cur.fetchone()
     con.close()
-    if not row:
-        return False
-    return datetime.datetime.now() < row[0]
+    return ok is not None
 
-# ========================= ADMIN COMMANDS =========================
+# ============ ADMIN COMMANDS =================
 
 @bot.message_handler(commands=["approve"])
-def approve_user(msg):
+def approve_cmd(msg):
     if not is_admin(msg.from_user.id):
         return
-
-    try:
-        uid = int(msg.text.split()[1])
-        con = get_db()
-        cur = con.cursor()
-        cur.execute("INSERT INTO approved_users VALUES (%s) ON CONFLICT DO NOTHING", (uid,))
-        con.commit()
-        con.close()
-        bot.reply_to(msg, "✅ User approved.")
-    except:
-        bot.reply_to(msg, "❌ Usage: /approve USER_ID")
-
-@bot.message_handler(commands=["disapprove"])
-def disapprove_user(msg):
-    if not is_admin(msg.from_user.id):
-        return
-
-    try:
-        uid = int(msg.text.split()[1])
-        con = get_db()
-        cur = con.cursor()
-        cur.execute("DELETE FROM approved_users WHERE user_id=%s", (uid,))
-        con.commit()
-        con.close()
-        bot.reply_to(msg, "✅ User removed.")
-    except:
-        bot.reply_to(msg, "❌ Usage: /disapprove USER_ID")
-
-@bot.message_handler(commands=["grant"])
-def grant_email(msg):
-    if not is_admin(msg.from_user.id):
-        return
-
-    try:
-        parts = msg.text.split()
-        uid = int(parts[1])
-        email = parts[2]
-        days = int(parts[3])
-
-        expiry = datetime.datetime.now() + datetime.timedelta(days=days)
-
-        con = get_db()
-        cur = con.cursor()
-        cur.execute("""
-            INSERT INTO granted_emails VALUES (%s,%s,%s)
-        """, (uid, email, expiry))
-        con.commit()
-        con.close()
-
-        bot.reply_to(msg, f"✅ {email} granted to {uid} for {days} days.")
-    except:
-        bot.reply_to(msg, "❌ Usage: /grant USER_ID email@gmail.com days")
-
-@bot.message_handler(commands=["revoke"])
-def revoke_email(msg):
-    if not is_admin(msg.from_user.id):
-        return
-
-    try:
-        parts = msg.text.split()
-        uid = int(parts[1])
-        email = parts[2]
-
-        con = get_db()
-        cur = con.cursor()
-        cur.execute("""
-            DELETE FROM granted_emails WHERE user_id=%s AND email=%s
-        """, (uid, email))
-        con.commit()
-        con.close()
-
-        bot.reply_to(msg, "✅ Email revoked.")
-    except:
-        bot.reply_to(msg, "❌ Usage: /revoke USER_ID email@gmail.com")
-
-# ========================= OTP FETCH =========================
-
-@bot.message_handler(commands=["get"])
-def get_otp(msg):
-    uid = msg.from_user.id
-    email = msg.text.replace("/get", "").strip()
-
-    if not email:
-        bot.reply_to(msg, "❌ Usage: /get email@gmail.com")
-        return
-
-    # ✅ ADMIN BYPASS — FULL ACCESS
-    if not is_admin(uid):
-        if not is_approved(uid):
-            bot.reply_to(msg, "⛔ You are not approved.")
-            return
-
-        if not has_email_access(uid, email):
-            bot.reply_to(msg, "⛔ You don't have access to this email.")
-            return
-
+    uid = int(msg.text.split()[1])
     con = get_db()
     cur = con.cursor()
-    cur.execute("""
-        SELECT otp, time FROM otps 
-        WHERE email=%s 
-        ORDER BY time DESC LIMIT 1
-    """, (email,))
-    row = cur.fetchone()
-    con.close()
-
-    if not row:
-        bot.reply_to(msg, "❌ No OTP found.")
-        return
-
-    otp, time = row
-    bot.reply_to(msg, f"✅ Netflix OTP: {otp}\n⏰ {time}")
-
-# ========================= OTP INGESTION (NETFLIX 4 DIGIT ONLY) =========================
-
-def save_otp_from_email(email_body, to_email):
-    match = re.search(r"\b\d{4}\b", email_body)
-    if not match:
-        return
-
-    otp = match.group()
-
-    con = get_db()
-    cur = con.cursor()
-    cur.execute("""
-        INSERT INTO otps VALUES (%s,%s,NOW())
-    """, (to_email, otp))
+    cur.execute("INSERT INTO approved_users(user_id) VALUES(%s) ON CONFLICT DO NOTHING", (uid,))
     con.commit()
     con.close()
+    bot.reply_to(msg, "✅ User approved")
 
-# ========================= START =========================
+@bot.message_handler(commands=["disapprove"])
+def disapprove_cmd(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    uid = int(msg.text.split()[1])
+    con = get_db()
+    cur = con.cursor()
+    cur.execute("DELETE FROM approved_users WHERE user_id=%s", (uid,))
+    con.commit()
+    con.close()
+    bot.reply_to(msg, "✅ User removed")
 
-init_db()
-bot.polling()
+@bot.message_handler(commands=["addemail"])
+def addemail_cmd(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    _, email_addr, password, protocol, server, port = msg.text.split()
+    con = get_db()
+    cur = con.cursor()
+    cur.execute("""
+    INSERT INTO accounts VALUES(%s,%s,%s,%s,%s)
+    ON CONFLICT(email) DO UPDATE SET
+    password=excluded.password,
+    protocol=excluded.protocol,
+    server=excluded.server,
+    port=excluded.port
+    """, (email_addr, password, protocol, server, int(port)))
+    con.commit()
+    con.close()
+    bot.reply_to(msg, "✅ Email inbox saved")
+
+@bot.message_handler(commands=["grant"])
+def grant_cmd(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    _, uid, email_addr, days = msg.text.split()
+    expires = datetime.now() + timedelta(days=int(days))
+
+    con = get_db()
+    cur = con.cursor()
+    cur.execute("INSERT INTO grants VALUES(%s,%s,%s)", (int(uid), email_addr, expires))
+    con.commit()
+    con.close()
+    bot.reply_to(msg, "✅ Access granted")
+
+@bot.message_handler(commands=["revoke"])
+def revoke_cmd(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    _, uid, email_addr = msg.text.split()
+    con = get_db()
+    cur = con.cursor()
+    cur.execute("DELETE FROM grants WHERE user_id=%s AND email=%s", (int(uid), email_addr))
+    con.commit()
+    con.close()
+    bot.reply_to(msg, "✅ Access revoked")
+
+# ============ OTP FETCH ==================
+
+def fetch_otp(acc):
+    if acc[2] == "imap":
+        mail = imaplib.IMAP4_SSL(acc[3], acc[4])
+        mail.login(acc[0], acc[1])
+        mail.select("inbox")
+        _, data = mail.search(None, "ALL")
+        ids = data[0].split()[-5:]
+        for i in reversed(ids):
+            _, msg_data = mail.fetch(i, "(RFC822)")
+            msg = email.message_from_bytes(msg_data[0][1])
+            body = ""
+            if msg.is_multipart():
+                for p in msg.walk():
+                    if p.get_content_type() == "text/plain":
+                        body = p.get_payload(decode=True).decode()
+            else:
+                body = msg.get_payload(decode=True).decode()
+
+            m = re.search(r"\b\d{4}\b", body)
+            if m:
+                return m.group()
+        return None
+
+    else:
+        pop = poplib.POP3_SSL(acc[3], acc[4])
+        pop.user(acc[0])
+        pop.pass_(acc[1])
+        count = len(pop.list()[1])
+
+        for i in range(count, 0, -1):
+            msg = b"\n".join(pop.retr(i)[1])
+            msg = email.message_from_bytes(msg)
+            body = msg.get_payload(decode=True).decode()
+            m = re.search(r"\b\d{4}\b", body)
+            if m:
+                return m.group()
+        return None
+
+# ============ USER COMMAND =================
+
+@bot.message_handler(commands=["get"])
+def get_cmd(msg):
+    uid = msg.from_user.id
+    email_addr = msg.text.split()[1]
+
+    if not is_approved(uid):
+        bot.reply_to(msg, "❌ Not approved")
+        return
+
+    if not has_access(uid, email_addr):
+        bot.reply_to(msg, "❌ No access to this email")
+        return
+
+    con = get_db()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM accounts WHERE email=%s", (email_addr,))
+    acc = cur.fetchone()
+    con.close()
+
+    otp = fetch_otp(acc)
+    bot.reply_to(msg, f"✅ Netflix OTP: {otp}")
+
+# ============ WEBHOOK =================
+
+@app.route("/" + BOT_TOKEN, methods=["POST"])
+def webhook():
+    update = telebot.types.Update.de_json(request.stream.read())
+    bot.process_new_updates([update])
+    return "OK", 200
+
+@app.route("/")
+def main():
+    bot.remove_webhook()
+    bot.set_webhook(url=os.getenv("RENDER_EXTERNAL_URL") + "/" + BOT_TOKEN)
+    return "OK"
+
+# ============ START =================
+if __name__ == "__main__":
+    init_db()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
