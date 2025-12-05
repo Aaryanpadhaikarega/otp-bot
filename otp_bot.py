@@ -1,252 +1,310 @@
-import telebot
-from flask import Flask, request
-import psycopg2
+#!/usr/bin/env python3
+
 import os
 import re
-from datetime import datetime
+import ssl
+import imaplib
+import poplib
+import email
+import psycopg2
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+from typing import Optional, Dict, List
 
-# ===========================
-# CONFIG
-# ===========================
+import telebot
+from flask import Flask, request
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_URL = os.getenv("DB_URL")
 
-# ✅ YOUR ADMIN TELEGRAM ID
-ADMIN_ID = 123456789   # 🔴 REPLACE THIS WITH YOUR REAL TELEGRAM ID
+# ================= CONFIG =================
 
-bot = telebot.TeleBot(BOT_TOKEN)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+DB_URL = os.getenv("DATABASE_URL", "").strip()
+
+if not BOT_TOKEN:
+    raise SystemExit("❌ BOT_TOKEN missing")
+if not ADMIN_ID:
+    raise SystemExit("❌ ADMIN_ID missing")
+if not DB_URL:
+    raise SystemExit("❌ DATABASE_URL missing")
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-# ===========================
-# DATABASE CONNECTION
-# ===========================
+
+# ================= DATABASE =================
 
 def get_db():
     return psycopg2.connect(DB_URL, sslmode="require")
+
 
 def init_db():
     con = get_db()
     cur = con.cursor()
 
-    # OTP storage
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS otps (
-            id SERIAL PRIMARY KEY,
-            email TEXT,
-            otp TEXT,
-            created_at TIMESTAMP
+        CREATE TABLE IF NOT EXISTS accounts (
+            email TEXT PRIMARY KEY,
+            password TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            server TEXT NOT NULL,
+            port INTEGER NOT NULL
         )
     """)
 
-    # Approved users
     cur.execute("""
         CREATE TABLE IF NOT EXISTS approved_users (
-            chat_id BIGINT UNIQUE
+            user_id BIGINT PRIMARY KEY
         )
     """)
 
-    # Emails waiting for approval
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS pending_emails (
-            email TEXT UNIQUE
+        CREATE TABLE IF NOT EXISTS user_email_access (
+            user_id BIGINT,
+            email TEXT,
+            expires_at TIMESTAMP,
+            PRIMARY KEY (user_id, email)
         )
     """)
 
     con.commit()
-    cur.close()
     con.close()
 
-# ===========================
-# UTILITIES
-# ===========================
 
-def is_admin(chat_id):
-    return chat_id == ADMIN_ID
+# ================= MODELS =================
 
-def is_user_approved(chat_id):
+@dataclass
+class Account:
+    email: str
+    password: str
+    protocol: str
+    server: str
+    port: int
+
+
+# ================= ADMIN HELPERS =================
+
+def is_admin(uid: int) -> bool:
+    return uid == ADMIN_ID
+
+
+def is_approved(uid: int) -> bool:
+    if is_admin(uid):
+        return True
+
     con = get_db()
     cur = con.cursor()
-    cur.execute("SELECT 1 FROM approved_users WHERE chat_id=%s", (chat_id,))
-    result = cur.fetchone()
-    cur.close()
+    cur.execute("SELECT 1 FROM approved_users WHERE user_id=%s", (uid,))
+    ok = cur.fetchone() is not None
     con.close()
-    return result is not None
+    return ok
 
-def save_otp(email, otp):
+
+def has_email_access(uid: int, email_addr: str) -> bool:
     con = get_db()
     cur = con.cursor()
-    cur.execute(
-        "INSERT INTO otps (email, otp, created_at) VALUES (%s, %s, %s)",
-        (email, otp, datetime.utcnow())
-    )
-    con.commit()
-    cur.close()
+    cur.execute("""
+        SELECT expires_at FROM user_email_access 
+        WHERE user_id=%s AND email=%s
+    """, (uid, email_addr))
+
+    row = cur.fetchone()
     con.close()
 
-def get_latest_otp(email):
-    con = get_db()
-    cur = con.cursor()
-    cur.execute(
-        "SELECT otp FROM otps WHERE email=%s ORDER BY created_at DESC LIMIT 1",
-        (email,)
-    )
-    result = cur.fetchone()
-    cur.close()
-    con.close()
-    return result[0] if result else None
+    if not row:
+        return False
 
-# ===========================
-# BOT COMMANDS
-# ===========================
+    return datetime.utcnow() < row[0]
+
+
+# ================= EMAIL =================
+
+NETFLIX_OTP_PATTERN = re.compile(r"\b\d{4}\b")
+
+
+def fetch_signin_code(acc: Account) -> List[str]:
+    codes = []
+
+    try:
+        if acc.protocol == "imap":
+            imap = imaplib.IMAP4_SSL(acc.server, acc.port)
+            imap.login(acc.email, acc.password)
+            imap.select("inbox")
+
+            status, data = imap.search(None, "ALL")
+            for num in data[0].split()[-10:]:
+                _, msg_data = imap.fetch(num, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    text = payload.decode(errors="ignore")
+                    codes.extend(NETFLIX_OTP_PATTERN.findall(text))
+
+            imap.logout()
+
+        else:  # POP3
+            pop = poplib.POP3_SSL(acc.server, acc.port)
+            pop.user(acc.email)
+            pop.pass_(acc.password)
+
+            count, _ = pop.stat()
+            for i in range(max(1, count - 10), count + 1):
+                _, lines, _ = pop.retr(i)
+                text = b"\n".join(lines).decode(errors="ignore")
+                codes.extend(NETFLIX_OTP_PATTERN.findall(text))
+
+            pop.quit()
+
+    except:
+        pass
+
+    return list(set(codes))
+
+
+# ================= BOT COMMANDS =================
 
 @bot.message_handler(commands=["start"])
-def start(msg):
-    if is_admin(msg.chat.id):
-        bot.send_message(msg.chat.id, "✅ Admin access enabled.")
-    elif is_user_approved(msg.chat.id):
-        bot.send_message(msg.chat.id, "✅ You are approved. Use /get <email>")
-    else:
-        bot.send_message(msg.chat.id, "❌ You are not approved. Ask admin.")
-
-# ---------------------------
-# ADD EMAIL TO PENDING LIST
-# ---------------------------
-
-@bot.message_handler(commands=["addemail"])
-def add_email(msg):
-    try:
-        email = msg.text.split(" ", 1)[1].strip()
-    except:
-        bot.send_message(msg.chat.id, "Usage: /addemail email@gmail.com")
+def start_cmd(msg):
+    if not is_approved(msg.from_user.id):
+        bot.reply_to(msg, "❌ You are not approved.")
         return
 
-    con = get_db()
-    cur = con.cursor()
-    try:
-        cur.execute("INSERT INTO pending_emails (email) VALUES (%s)", (email,))
-        con.commit()
-        bot.send_message(msg.chat.id, f"✅ Email added for approval:\n{email}")
-    except:
-        bot.send_message(msg.chat.id, "⚠️ Email already pending.")
-    finally:
-        cur.close()
-        con.close()
+    bot.reply_to(msg, "✅ Send:\n/get email@example.com")
 
-# ---------------------------
-# ADMIN: VIEW PENDING EMAILS
-# ---------------------------
-
-@bot.message_handler(commands=["pending"])
-def pending(msg):
-    if not is_admin(msg.chat.id):
-        bot.send_message(msg.chat.id, "❌ Admin only.")
-        return
-
-    con = get_db()
-    cur = con.cursor()
-    cur.execute("SELECT email FROM pending_emails")
-    rows = cur.fetchall()
-    cur.close()
-    con.close()
-
-    if not rows:
-        bot.send_message(msg.chat.id, "✅ No pending emails.")
-        return
-
-    text = "📩 Pending Emails:\n\n"
-    for r in rows:
-        text += f"• {r[0]}\n"
-
-    bot.send_message(msg.chat.id, text)
-
-# ---------------------------
-# ADMIN: APPROVE USER
-# ---------------------------
 
 @bot.message_handler(commands=["approve"])
-def approve(msg):
-    if not is_admin(msg.chat.id):
-        bot.send_message(msg.chat.id, "❌ Admin only.")
+def approve_cmd(msg):
+    if not is_admin(msg.from_user.id):
         return
 
     try:
-        chat_id = int(msg.text.split(" ", 1)[1])
-    except:
-        bot.send_message(msg.chat.id, "Usage: /approve CHAT_ID")
-        return
-
-    con = get_db()
-    cur = con.cursor()
-    try:
-        cur.execute("INSERT INTO approved_users (chat_id) VALUES (%s)", (chat_id,))
+        uid = int(msg.text.split()[1])
+        con = get_db()
+        cur = con.cursor()
+        cur.execute("INSERT INTO approved_users(user_id) VALUES(%s) ON CONFLICT DO NOTHING", (uid,))
         con.commit()
-        bot.send_message(msg.chat.id, f"✅ Approved: {chat_id}")
+        con.close()
+        bot.reply_to(msg, "✅ User approved.")
     except:
-        bot.send_message(msg.chat.id, "⚠️ User already approved.")
-    finally:
-        cur.close()
+        bot.reply_to(msg, "Usage: /approve 123456")
+
+
+@bot.message_handler(commands=["add"])
+def add_account_cmd(msg):
+    if not is_admin(msg.from_user.id):
+        return
+
+    try:
+        _, email_addr, password, protocol, server, port = msg.text.split()
+
+        con = get_db()
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO accounts(email,password,protocol,server,port)
+            VALUES(%s,%s,%s,%s,%s)
+            ON CONFLICT (email) DO UPDATE SET
+            password=EXCLUDED.password,
+            protocol=EXCLUDED.protocol,
+            server=EXCLUDED.server,
+            port=EXCLUDED.port
+        """, (email_addr, password, protocol, server, int(port)))
+
+        con.commit()
         con.close()
 
-# ---------------------------
-# GET OTP (ADMIN BYPASS ✅)
-# ---------------------------
+        bot.reply_to(msg, "✅ Account saved.")
+
+    except:
+        bot.reply_to(msg, "Usage:\n/add email pass imap mail.server.com 993")
+
+
+@bot.message_handler(commands=["grant"])
+def grant_cmd(msg):
+    if not is_admin(msg.from_user.id):
+        return
+
+    try:
+        _, uid, email_addr, days = msg.text.split()
+        expires = datetime.utcnow() + timedelta(days=int(days))
+
+        con = get_db()
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO user_email_access(user_id,email,expires_at)
+            VALUES(%s,%s,%s)
+            ON CONFLICT (user_id,email)
+            DO UPDATE SET expires_at=EXCLUDED.expires_at
+        """, (int(uid), email_addr, expires))
+
+        con.commit()
+        con.close()
+
+        bot.reply_to(msg, f"✅ Access granted for {days} days.")
+
+    except:
+        bot.reply_to(msg, "Usage: /grant 123456 email@example.com 7")
+
 
 @bot.message_handler(commands=["get"])
-def get_otp(msg):
-    chat_id = msg.chat.id
-
-    if not is_admin(chat_id) and not is_user_approved(chat_id):
-        bot.send_message(chat_id, "❌ You are not approved.")
+def get_cmd(msg):
+    uid = msg.from_user.id
+    if not is_approved(uid):
+        bot.reply_to(msg, "❌ Not approved.")
         return
 
     try:
-        email = msg.text.split(" ", 1)[1].strip()
+        email_addr = msg.text.split()[1]
+
+        if not has_email_access(uid, email_addr):
+            bot.reply_to(msg, "❌ No access to this email.")
+            return
+
+        con = get_db()
+        cur = con.cursor()
+        cur.execute("SELECT email,password,protocol,server,port FROM accounts WHERE email=%s", (email_addr,))
+        row = cur.fetchone()
+        con.close()
+
+        if not row:
+            bot.reply_to(msg, "❌ Email not found.")
+            return
+
+        acc = Account(*row)
+        codes = fetch_signin_code(acc)
+
+        if not codes:
+            bot.reply_to(msg, "⚠️ No OTP found.")
+        else:
+            bot.reply_to(msg, "✅ Latest Codes:\n" + "\n".join(codes))
+
     except:
-        bot.send_message(chat_id, "Usage: /get email@gmail.com")
-        return
+        bot.reply_to(msg, "Usage: /get email@example.com")
 
-    otp = get_latest_otp(email)
 
-    if otp:
-        bot.send_message(chat_id, f"✅ Latest OTP for {email}:\n\n🔐 {otp}")
-    else:
-        bot.send_message(chat_id, "❌ No OTP found.")
-
-# ===========================
-# EMAIL CAPTCHA / OTP PARSER (4 DIGITS NETFLIX)
-# ===========================
-
-def extract_netflix_otp(text):
-    match = re.search(r"\b\d{4}\b", text)
-    return match.group() if match else None
-
-# ===========================
-# WEBHOOK FIX ✅ (IMPORTANT)
-# ===========================
+# ================= WEBHOOK =================
 
 @app.route("/" + BOT_TOKEN, methods=["POST"])
-def webhook():
-    try:
-        json_str = request.stream.read().decode("utf-8")
-        update = telebot.types.Update.de_json(json_str)
-        bot.process_new_updates([update])
-        return "OK", 200
-    except Exception as e:
-        print("Webhook error:", e)
-        return "ERR", 500
+def webhook_receive():
+    json_str = request.stream.read().decode("utf-8")
+    update = telebot.types.Update.de_json(json_str)
+    bot.process_new_updates([update])
+    return "OK", 200
 
 
 @app.route("/")
-def main():
+def webhook_set():
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    webhook_url = render_url.rstrip("/") + "/" + BOT_TOKEN
     bot.remove_webhook()
-    bot.set_webhook(url=os.getenv("RENDER_EXTERNAL_URL") + "/" + BOT_TOKEN)
-    return "Webhook set", 200
+    bot.set_webhook(url=webhook_url)
+    return "Webhook Set", 200
 
-# ===========================
-# START
-# ===========================
+
+# ================= MAIN =================
 
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
