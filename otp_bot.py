@@ -1,310 +1,115 @@
-#!/usr/bin/env python3
-
-import os
-import re
-import ssl
-import imaplib
-import poplib
-import email
-import psycopg2
-from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import Optional, Dict, List
-
 import telebot
-from flask import Flask, request
+import psycopg2
+import re
+import os
+from datetime import datetime
 
+# ==========================
+# CONFIG
+# ==========================
 
-# ================= CONFIG =================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DB_URL = os.getenv("DATABASE_URL")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+bot = telebot.TeleBot(BOT_TOKEN)
 
-DB_URL = os.getenv("DATABASE_URL", "").strip()
+# ✅ ONLY 4 DIGIT NETFLIX OTP
+NETFLIX_OTP_PATTERN = re.compile(r"\b\d{4}\b")
 
-if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN missing")
-if not ADMIN_ID:
-    raise SystemExit("❌ ADMIN_ID missing")
-if not DB_URL:
-    raise SystemExit("❌ DATABASE_URL missing")
-
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-app = Flask(__name__)
-
-
-# ================= DATABASE =================
+# ==========================
+# DATABASE
+# ==========================
 
 def get_db():
     return psycopg2.connect(DB_URL, sslmode="require")
 
-
 def init_db():
     con = get_db()
     cur = con.cursor()
-
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS accounts (
-            email TEXT PRIMARY KEY,
-            password TEXT NOT NULL,
-            protocol TEXT NOT NULL,
-            server TEXT NOT NULL,
-            port INTEGER NOT NULL
+        CREATE TABLE IF NOT EXISTS otps (
+            id SERIAL PRIMARY KEY,
+            otp VARCHAR(10),
+            time TIMESTAMP
         )
     """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS approved_users (
-            user_id BIGINT PRIMARY KEY
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS user_email_access (
-            user_id BIGINT,
-            email TEXT,
-            expires_at TIMESTAMP,
-            PRIMARY KEY (user_id, email)
-        )
-    """)
-
     con.commit()
+    cur.close()
     con.close()
 
+# ==========================
+# SAVE OTP
+# ==========================
 
-# ================= MODELS =================
-
-@dataclass
-class Account:
-    email: str
-    password: str
-    protocol: str
-    server: str
-    port: int
-
-
-# ================= ADMIN HELPERS =================
-
-def is_admin(uid: int) -> bool:
-    return uid == ADMIN_ID
-
-
-def is_approved(uid: int) -> bool:
-    if is_admin(uid):
-        return True
-
+def save_otp(otp):
     con = get_db()
     cur = con.cursor()
-    cur.execute("SELECT 1 FROM approved_users WHERE user_id=%s", (uid,))
-    ok = cur.fetchone() is not None
+    cur.execute(
+        "INSERT INTO otps (otp, time) VALUES (%s, %s)",
+        (otp, datetime.now())
+    )
+    con.commit()
+    cur.close()
     con.close()
-    return ok
 
+# ==========================
+# GET LAST OTP
+# ==========================
 
-def has_email_access(uid: int, email_addr: str) -> bool:
+def get_last_otp():
     con = get_db()
     cur = con.cursor()
-    cur.execute("""
-        SELECT expires_at FROM user_email_access 
-        WHERE user_id=%s AND email=%s
-    """, (uid, email_addr))
-
+    cur.execute("SELECT otp, time FROM otps ORDER BY id DESC LIMIT 1")
     row = cur.fetchone()
+    cur.close()
     con.close()
+    return row
 
-    if not row:
-        return False
-
-    return datetime.utcnow() < row[0]
-
-
-# ================= EMAIL =================
-
-NETFLIX_OTP_PATTERN = re.compile(r"\b\d{6}\b")
-
-
-def fetch_signin_code(acc: Account) -> List[str]:
-    codes = []
-
-    try:
-        if acc.protocol == "imap":
-            imap = imaplib.IMAP4_SSL(acc.server, acc.port)
-            imap.login(acc.email, acc.password)
-            imap.select("inbox")
-
-            status, data = imap.search(None, "ALL")
-            for num in data[0].split()[-10:]:
-                _, msg_data = imap.fetch(num, "(RFC822)")
-                msg = email.message_from_bytes(msg_data[0][1])
-
-                payload = msg.get_payload(decode=True)
-                if payload:
-                    text = payload.decode(errors="ignore")
-                    codes.extend(NETFLIX_OTP_PATTERN.findall(text))
-
-            imap.logout()
-
-        else:  # POP3
-            pop = poplib.POP3_SSL(acc.server, acc.port)
-            pop.user(acc.email)
-            pop.pass_(acc.password)
-
-            count, _ = pop.stat()
-            for i in range(max(1, count - 10), count + 1):
-                _, lines, _ = pop.retr(i)
-                text = b"\n".join(lines).decode(errors="ignore")
-                codes.extend(NETFLIX_OTP_PATTERN.findall(text))
-
-            pop.quit()
-
-    except:
-        pass
-
-    return list(set(codes))
-
-
-# ================= BOT COMMANDS =================
+# ==========================
+# BOT COMMANDS
+# ==========================
 
 @bot.message_handler(commands=["start"])
-def start_cmd(msg):
-    if not is_approved(msg.from_user.id):
-        bot.reply_to(msg, "❌ You are not approved.")
+def start(msg):
+    bot.reply_to(msg, "✅ Netflix OTP Bot is LIVE.\nSend OTP to store.")
+
+@bot.message_handler(commands=["lastotp"])
+def last_otp(msg):
+    if msg.from_user.id != ADMIN_ID:
+        bot.reply_to(msg, "❌ Access Denied.")
         return
 
-    bot.reply_to(msg, "✅ Send:\n/get email@example.com")
+    data = get_last_otp()
+    if not data:
+        bot.reply_to(msg, "No OTP saved yet.")
+    else:
+        otp, time = data
+        bot.reply_to(msg, f"🎯 Last Netflix OTP: {otp}\n🕒 Time: {time}")
 
+# ==========================
+# OTP LISTENER
+# ==========================
 
-@bot.message_handler(commands=["approve"])
-def approve_cmd(msg):
-    if not is_admin(msg.from_user.id):
-        return
+@bot.message_handler(func=lambda message: True)
+def otp_listener(message):
+    text = message.text
 
-    try:
-        uid = int(msg.text.split()[1])
-        con = get_db()
-        cur = con.cursor()
-        cur.execute("INSERT INTO approved_users(user_id) VALUES(%s) ON CONFLICT DO NOTHING", (uid,))
-        con.commit()
-        con.close()
-        bot.reply_to(msg, "✅ User approved.")
-    except:
-        bot.reply_to(msg, "Usage: /approve 123456")
+    match = NETFLIX_OTP_PATTERN.search(text)
+    if match:
+        otp = match.group()
+        save_otp(otp)
 
+        bot.send_message(
+            ADMIN_ID,
+            f"✅ New Netflix OTP Received:\n🔐 OTP: {otp}"
+        )
 
-@bot.message_handler(commands=["add"])
-def add_account_cmd(msg):
-    if not is_admin(msg.from_user.id):
-        return
-
-    try:
-        _, email_addr, password, protocol, server, port = msg.text.split()
-
-        con = get_db()
-        cur = con.cursor()
-        cur.execute("""
-            INSERT INTO accounts(email,password,protocol,server,port)
-            VALUES(%s,%s,%s,%s,%s)
-            ON CONFLICT (email) DO UPDATE SET
-            password=EXCLUDED.password,
-            protocol=EXCLUDED.protocol,
-            server=EXCLUDED.server,
-            port=EXCLUDED.port
-        """, (email_addr, password, protocol, server, int(port)))
-
-        con.commit()
-        con.close()
-
-        bot.reply_to(msg, "✅ Account saved.")
-
-    except:
-        bot.reply_to(msg, "Usage:\n/add email pass imap mail.server.com 993")
-
-
-@bot.message_handler(commands=["grant"])
-def grant_cmd(msg):
-    if not is_admin(msg.from_user.id):
-        return
-
-    try:
-        _, uid, email_addr, days = msg.text.split()
-        expires = datetime.utcnow() + timedelta(days=int(days))
-
-        con = get_db()
-        cur = con.cursor()
-        cur.execute("""
-            INSERT INTO user_email_access(user_id,email,expires_at)
-            VALUES(%s,%s,%s)
-            ON CONFLICT (user_id,email)
-            DO UPDATE SET expires_at=EXCLUDED.expires_at
-        """, (int(uid), email_addr, expires))
-
-        con.commit()
-        con.close()
-
-        bot.reply_to(msg, f"✅ Access granted for {days} days.")
-
-    except:
-        bot.reply_to(msg, "Usage: /grant 123456 email@example.com 7")
-
-
-@bot.message_handler(commands=["get"])
-def get_cmd(msg):
-    uid = msg.from_user.id
-    if not is_approved(uid):
-        bot.reply_to(msg, "❌ Not approved.")
-        return
-
-    try:
-        email_addr = msg.text.split()[1]
-
-        if not has_email_access(uid, email_addr):
-            bot.reply_to(msg, "❌ No access to this email.")
-            return
-
-        con = get_db()
-        cur = con.cursor()
-        cur.execute("SELECT email,password,protocol,server,port FROM accounts WHERE email=%s", (email_addr,))
-        row = cur.fetchone()
-        con.close()
-
-        if not row:
-            bot.reply_to(msg, "❌ Email not found.")
-            return
-
-        acc = Account(*row)
-        codes = fetch_signin_code(acc)
-
-        if not codes:
-            bot.reply_to(msg, "⚠️ No OTP found.")
-        else:
-            bot.reply_to(msg, "✅ Latest Codes:\n" + "\n".join(codes))
-
-    except:
-        bot.reply_to(msg, "Usage: /get email@example.com")
-
-
-# ================= WEBHOOK =================
-
-@app.route("/" + BOT_TOKEN, methods=["POST"])
-def webhook_receive():
-    json_str = request.stream.read().decode("utf-8")
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
-    return "OK", 200
-
-
-@app.route("/")
-def webhook_set():
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
-    webhook_url = render_url.rstrip("/") + "/" + BOT_TOKEN
-    bot.remove_webhook()
-    bot.set_webhook(url=webhook_url)
-    return "Webhook Set", 200
-
-
-# ================= MAIN =================
+# ==========================
+# START BOT
+# ==========================
 
 if __name__ == "__main__":
     init_db()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    print("✅ Netflix 4-Digit OTP Bot Running...")
+    bot.infinity_polling()
