@@ -101,14 +101,31 @@ def has_email_access(uid: int, email_addr: str) -> bool:
     return datetime.utcnow() < row[0]
 
 # ================= OTP DETECTOR =================
-
 def find_signin_code(body):
-    match = re.search(r"(\d{4})", body)
-    if match:
-        return match.group(1)
+    """
+    Extract 4-digit sign-in code using safe language-agnostic patterns.
+    """
+    patterns = [
+        r"\n\s*(\d{4})\s*\n",                          # OTP on its own line (Netflix style)
+        r"^\s*(\d{4})\s*$",                            # Only 4 digits in body
+        r"(?:code|código|codice|codigo|otp)[^0-9]*(\d{4})"
+    ]
+
+    for pat in patterns:
+        matches = re.findall(pat, body, flags=re.IGNORECASE | re.MULTILINE)
+        for match in matches:
+            code = match if isinstance(match, str) else match[0]
+
+            if len(code) == 4 and code.isdigit():
+                # ❌ Block dates/ranges like 2025-12, 1234/5678 etc.
+                ctx_start = max(0, body.find(code) - 10)
+                ctx_end = min(len(body), body.find(code) + 14)
+                surrounding = body[ctx_start:ctx_end]
+
+                if not re.search(r"\d{4}[-./]\d{1,2}|\d{4}[-./]\d{4}", surrounding):
+                    return code
+
     return None
-
-
 
 # ================= EMAIL FETCH =================
 
@@ -120,7 +137,7 @@ def fetch_signin_code(acc: Account) -> List[str]:
             imap.select("inbox")
 
             _, data = imap.search(None, "ALL")
-            email_ids = data[0].split()[-10:]
+            email_ids = data[0].split()[-10:]  # last 10 emails
 
             for num in reversed(email_ids):
                 _, msg_data = imap.fetch(num, "(RFC822)")
@@ -130,8 +147,7 @@ def fetch_signin_code(acc: Account) -> List[str]:
 
                 if msg.is_multipart():
                     for part in msg.walk():
-                        ctype = part.get_content_type()
-                        if ctype in ["text/plain", "text/html"]:
+                        if part.get_content_type() in ["text/plain", "text/html"]:
                             payload = part.get_payload(decode=True)
                             if payload:
                                 full_text += payload.decode(errors="ignore") + "\n"
@@ -147,7 +163,7 @@ def fetch_signin_code(acc: Account) -> List[str]:
 
             imap.logout()
 
-        else:  # ✅ POP3 FIXED TOO
+        else:  # ✅ POP3 SUPPORT
             pop = poplib.POP3_SSL(acc.server, acc.port)
             pop.user(acc.email)
             pop.pass_(acc.password)
@@ -169,6 +185,7 @@ def fetch_signin_code(acc: Account) -> List[str]:
         print("EMAIL ERROR:", e)
 
     return []
+
 
 # ================= BOT COMMANDS =================
 
