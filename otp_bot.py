@@ -103,20 +103,31 @@ def has_email_access(uid: int, email_addr: str) -> bool:
 # ================= OTP DETECTOR =================
 
 def find_signin_code(body):
-    body = body.lower()
+    body = body.replace("\r", "")
 
-    patterns = [
-        # code 1 2 3 4
+    # ✅ NETFLIX EXACT FORMAT (next line is the OTP)
+    netflix_match = re.search(
+        r"enter this code to sign in\s*\n\s*((?:\d\s*){4})",
+        body,
+        re.IGNORECASE
+    )
+
+    if netflix_match:
+        raw = netflix_match.group(1)
+        code = re.sub(r"\s+", "", raw)
+        if code.isdigit() and len(code) == 4:
+            return code
+
+    # ✅ FALLBACK: keyword + gapped digits (safe)
+    fallback_patterns = [
         r"(?:code|otp|verification|verify|sign in|signin)[^0-9]{0,20}((?:\d\s*){4})",
-
-        # use 1 2 3 4 to sign in
-        r"use[^0-9]{0,20}((?:\d\s*){4})[^a-z]{0,10}(?:to|for)?[^a-z]{0,5}(?:sign|login)"
+        r"use[^0-9]{0,20}((?:\d\s*){4})[^a-z]{0,10}(?:sign|login)"
     ]
 
-    for pat in patterns:
+    for pat in fallback_patterns:
         matches = re.findall(pat, body, flags=re.IGNORECASE)
         for raw in matches:
-            code = re.sub(r"\s+", "", raw)  # remove spaces
+            code = re.sub(r"\s+", "", raw)
 
             if not code.isdigit() or len(code) != 4:
                 continue
