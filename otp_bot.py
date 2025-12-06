@@ -2,7 +2,6 @@
 
 import os
 import re
-import ssl
 import imaplib
 import poplib
 import email
@@ -101,47 +100,61 @@ def has_email_access(uid: int, email_addr: str) -> bool:
         return False
     return datetime.utcnow() < row[0]
 
-# ================= ✅ NETFLIX OTP DETECTOR (FINAL FIX) =================
+# ================= ✅ FRIEND’S WORKING OTP LOGIC =================
 
-def find_signin_code(text):
-    text = re.sub(r"<.*?>", " ", text)   # strip html
-    text = text.replace("&nbsp;", " ")
-    text = re.sub(r"\s+", " ", text)
-
-    # ✅ Convert spaced digits: "1 8 0 0" → "1800"
-    text = re.sub(r"(\d)\s+(\d)\s+(\d)\s+(\d)", r"\1\2\3\4", text)
-
+def find_signin_code(body):
     patterns = [
-        r"enter this code.*?(\d{4})",
-        r"sign in.*?(\d{4})",
-        r"netflix.*?(\d{4})",
+        r"\n\s*(\d{4})\s*\n",
+        r"^\s*(\d{4})\s*$",
+        r"(?:code|código|codice|codigo|codice|entry|enter)[^0-9]*(\d{4})",
         r"\b(\d{4})\b"
     ]
 
-    for pat in patterns:
-        match = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            code = match.group(1)
-            if not re.match(r"19\d\d|20\d\d", code):  # block years
-                return code
+    body = re.sub(r"<.*?>", " ", body)
+    body = re.sub(r"\s+", " ", body)
 
+    # ✅ Convert spaced digits → 1 8 0 0 → 1800
+    body = re.sub(r"(\d)\s+(\d)\s+(\d)\s+(\d)", r"\1\2\3\4", body)
+
+    for pat in patterns:
+        matches = re.findall(pat, body, flags=re.IGNORECASE | re.MULTILINE)
+        for match in matches:
+            code = match if isinstance(match, str) else match[0]
+            if len(code) == 4 and code.isdigit():
+                # ✅ Block years
+                if not re.match(r"19\d\d|20\d\d", code):
+                    return code
     return None
 
-# ================= EMAIL FETCH =================
+def is_netflix_signin_email(subject, body_lower):
+    if "netflix" not in subject and "netflix" not in body_lower:
+        return False
 
-def extract_email_text(msg):
-    body = ""
+    signin_indicators = [
+        "code", "enter", "sign in", "signin",
+        "device", "dispositivo", "appareil"
+    ]
+
+    has_indicator = any(i in subject or i in body_lower for i in signin_indicators)
+    has_code = bool(re.search(r"\b\d{4}\b", body_lower))
+
+    return has_indicator and has_code
+
+def extract_body(msg):
+    text = ""
     if msg.is_multipart():
         for part in msg.walk():
             if part.get_content_type() in ("text/plain", "text/html"):
                 payload = part.get_payload(decode=True)
                 if payload:
-                    body += payload.decode(errors="ignore") + "\n"
+                    text += payload.decode(errors="ignore") + "\n"
     else:
         payload = msg.get_payload(decode=True)
         if payload:
-            body = payload.decode(errors="ignore")
-    return body
+            text = payload.decode(errors="ignore")
+    return text
+
+# ================= ✅ EMAIL FETCH =================
 
 def fetch_signin_code(acc: Account) -> List[str]:
     try:
@@ -151,18 +164,21 @@ def fetch_signin_code(acc: Account) -> List[str]:
             imap.select("inbox")
 
             _, data = imap.search(None, "ALL")
-            email_ids = data[0].split()[-10:]
+            ids = data[0].split()
 
-            for num in reversed(email_ids):
-                _, msg_data = imap.fetch(num, "(RFC822)")
+            for eid in reversed(ids[-15:]):  # ✅ newest first
+                _, msg_data = imap.fetch(eid, "(RFC822)")
                 msg = email.message_from_bytes(msg_data[0][1], policy=policy.default)
 
-                text = extract_email_text(msg)
-                code = find_signin_code(text)
+                subject = (msg["subject"] or "").lower()
+                body = extract_body(msg)
+                body_lower = body.lower()
 
-                if code:
-                    imap.logout()
-                    return [code]
+                if is_netflix_signin_email(subject, body_lower):
+                    code = find_signin_code(body)
+                    if code:
+                        imap.logout()
+                        return [code]
 
             imap.logout()
 
@@ -173,14 +189,15 @@ def fetch_signin_code(acc: Account) -> List[str]:
 
             count, _ = pop.stat()
 
-            for i in range(count, max(1, count - 10), -1):
+            for i in range(count, max(1, count - 15), -1):
                 _, lines, _ = pop.retr(i)
                 text = b"\n".join(lines).decode(errors="ignore")
 
-                code = find_signin_code(text)
-                if code:
-                    pop.quit()
-                    return [code]
+                if is_netflix_signin_email("", text.lower()):
+                    code = find_signin_code(text)
+                    if code:
+                        pop.quit()
+                        return [code]
 
             pop.quit()
 
@@ -206,10 +223,7 @@ def approve_cmd(msg):
         uid = int(msg.text.split()[1])
         con = get_db()
         cur = con.cursor()
-        cur.execute(
-            "INSERT INTO approved_users(user_id) VALUES(%s) ON CONFLICT DO NOTHING",
-            (uid,)
-        )
+        cur.execute("INSERT INTO approved_users(user_id) VALUES(%s) ON CONFLICT DO NOTHING", (uid,))
         con.commit()
         con.close()
         bot.reply_to(msg, "✅ User approved.")
@@ -278,10 +292,7 @@ def get_cmd(msg):
 
         con = get_db()
         cur = con.cursor()
-        cur.execute("""
-            SELECT email,password,protocol,server,port 
-            FROM accounts WHERE email=%s
-        """, (email_addr,))
+        cur.execute("SELECT email,password,protocol,server,port FROM accounts WHERE email=%s", (email_addr,))
         row = cur.fetchone()
         con.close()
 
