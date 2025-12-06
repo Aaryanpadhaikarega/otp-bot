@@ -9,17 +9,14 @@ import email
 import psycopg2
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from typing import Optional, Dict, List
-
+from typing import List
 import telebot
 from flask import Flask, request
-
 
 # ================= CONFIG =================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-
 DB_URL = os.getenv("DATABASE_URL", "").strip()
 
 if not BOT_TOKEN:
@@ -32,17 +29,14 @@ if not DB_URL:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-
 # ================= DATABASE =================
 
 def get_db():
     return psycopg2.connect(DB_URL, sslmode="require")
 
-
 def init_db():
     con = get_db()
     cur = con.cursor()
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS accounts (
             email TEXT PRIMARY KEY,
@@ -52,13 +46,11 @@ def init_db():
             port INTEGER NOT NULL
         )
     """)
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS approved_users (
             user_id BIGINT PRIMARY KEY
         )
     """)
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_email_access (
             user_id BIGINT,
@@ -67,10 +59,8 @@ def init_db():
             PRIMARY KEY (user_id, email)
         )
     """)
-
     con.commit()
     con.close()
-
 
 # ================= MODELS =================
 
@@ -82,24 +72,20 @@ class Account:
     server: str
     port: int
 
-
 # ================= ADMIN HELPERS =================
 
 def is_admin(uid: int) -> bool:
     return uid == ADMIN_ID
 
-
 def is_approved(uid: int) -> bool:
     if is_admin(uid):
         return True
-
     con = get_db()
     cur = con.cursor()
     cur.execute("SELECT 1 FROM approved_users WHERE user_id=%s", (uid,))
     ok = cur.fetchone() is not None
     con.close()
     return ok
-
 
 def has_email_access(uid: int, email_addr: str) -> bool:
     con = get_db()
@@ -108,43 +94,65 @@ def has_email_access(uid: int, email_addr: str) -> bool:
         SELECT expires_at FROM user_email_access 
         WHERE user_id=%s AND email=%s
     """, (uid, email_addr))
-
     row = cur.fetchone()
     con.close()
-
     if not row:
         return False
-
     return datetime.utcnow() < row[0]
 
+# ================= OTP DETECTOR =================
 
-# ================= EMAIL =================
+def find_signin_code(body):
+    patterns = [
+        r"\n\s*(\d{4})\s*\n",
+        r"^\s*(\d{4})\s*$",
+        r"(?:code|código|codice|otp|verification|sign in)[^0-9]{0,10}(\d{4})",
+        r"\b(\d{4})\b"
+    ]
 
-NETFLIX_OTP_PATTERN = re.compile(
-    r"Enter this code to sign in\s*[:\-\n]?\s*(\d{4})",
-    re.IGNORECASE
-)
+    for pat in patterns:
+        matches = re.findall(pat, body, flags=re.IGNORECASE)
+        for match in matches:
+            code = match if isinstance(match, str) else match[0]
 
+            if len(code) == 4 and code.isdigit():
+                pos = body.find(code)
+                nearby = body[max(0, pos-10): pos+14]
 
+                if not re.search(r"\d{4}[-/.]\d{4}", nearby):
+                    return code
+    return None
+
+# ================= EMAIL FETCH =================
 
 def fetch_signin_code(acc: Account) -> List[str]:
-    codes = []
-
     try:
         if acc.protocol == "imap":
             imap = imaplib.IMAP4_SSL(acc.server, acc.port)
             imap.login(acc.email, acc.password)
             imap.select("inbox")
 
-            status, data = imap.search(None, "ALL")
-            for num in data[0].split()[-10:]:
+            _, data = imap.search(None, "ALL")
+            email_ids = data[0].split()[-10:]
+
+            for num in reversed(email_ids):
                 _, msg_data = imap.fetch(num, "(RFC822)")
                 msg = email.message_from_bytes(msg_data[0][1])
 
-                payload = msg.get_payload(decode=True)
-                if payload:
-                    text = payload.decode(errors="ignore")
-                    codes.extend(NETFLIX_OTP_PATTERN.findall(text))
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            text = part.get_payload(decode=True).decode(errors="ignore")
+                            code = find_signin_code(text)
+                            if code:
+                                imap.logout()
+                                return [code]
+                else:
+                    text = msg.get_payload(decode=True).decode(errors="ignore")
+                    code = find_signin_code(text)
+                    if code:
+                        imap.logout()
+                        return [code]
 
             imap.logout()
 
@@ -154,18 +162,22 @@ def fetch_signin_code(acc: Account) -> List[str]:
             pop.pass_(acc.password)
 
             count, _ = pop.stat()
-            for i in range(max(1, count - 10), count + 1):
+
+            for i in range(count, max(1, count - 10), -1):
                 _, lines, _ = pop.retr(i)
                 text = b"\n".join(lines).decode(errors="ignore")
-                codes.extend(NETFLIX_OTP_PATTERN.findall(text))
+
+                code = find_signin_code(text)
+                if code:
+                    pop.quit()
+                    return [code]
 
             pop.quit()
 
     except:
         pass
 
-    return list(set(codes))
-
+    return []
 
 # ================= BOT COMMANDS =================
 
@@ -174,65 +186,57 @@ def start_cmd(msg):
     if not is_approved(msg.from_user.id):
         bot.reply_to(msg, "❌ You are not approved.")
         return
-
     bot.reply_to(msg, "✅ Send:\n/get email@example.com")
-
 
 @bot.message_handler(commands=["approve"])
 def approve_cmd(msg):
     if not is_admin(msg.from_user.id):
         return
-
     try:
         uid = int(msg.text.split()[1])
         con = get_db()
         cur = con.cursor()
-        cur.execute("INSERT INTO approved_users(user_id) VALUES(%s) ON CONFLICT DO NOTHING", (uid,))
+        cur.execute(
+            "INSERT INTO approved_users(user_id) VALUES(%s) ON CONFLICT DO NOTHING",
+            (uid,)
+        )
         con.commit()
         con.close()
         bot.reply_to(msg, "✅ User approved.")
     except:
         bot.reply_to(msg, "Usage: /approve 123456")
 
-
 @bot.message_handler(commands=["add"])
 def add_account_cmd(msg):
     if not is_admin(msg.from_user.id):
         return
-
     try:
         _, email_addr, password, protocol, server, port = msg.text.split()
-
         con = get_db()
         cur = con.cursor()
         cur.execute("""
             INSERT INTO accounts(email,password,protocol,server,port)
             VALUES(%s,%s,%s,%s,%s)
-            ON CONFLICT (email) DO UPDATE SET
-            password=EXCLUDED.password,
-            protocol=EXCLUDED.protocol,
-            server=EXCLUDED.server,
-            port=EXCLUDED.port
+            ON CONFLICT (email)
+            DO UPDATE SET
+                password=EXCLUDED.password,
+                protocol=EXCLUDED.protocol,
+                server=EXCLUDED.server,
+                port=EXCLUDED.port
         """, (email_addr, password, protocol, server, int(port)))
-
         con.commit()
         con.close()
-
         bot.reply_to(msg, "✅ Account saved.")
-
     except:
         bot.reply_to(msg, "Usage:\n/add email pass imap mail.server.com 993")
-
 
 @bot.message_handler(commands=["grant"])
 def grant_cmd(msg):
     if not is_admin(msg.from_user.id):
         return
-
     try:
         _, uid, email_addr, days = msg.text.split()
         expires = datetime.utcnow() + timedelta(days=int(days))
-
         con = get_db()
         cur = con.cursor()
         cur.execute("""
@@ -241,19 +245,16 @@ def grant_cmd(msg):
             ON CONFLICT (user_id,email)
             DO UPDATE SET expires_at=EXCLUDED.expires_at
         """, (int(uid), email_addr, expires))
-
         con.commit()
         con.close()
-
         bot.reply_to(msg, f"✅ Access granted for {days} days.")
-
     except:
         bot.reply_to(msg, "Usage: /grant 123456 email@example.com 7")
-
 
 @bot.message_handler(commands=["get"])
 def get_cmd(msg):
     uid = msg.from_user.id
+
     if not is_approved(uid):
         bot.reply_to(msg, "❌ Not approved.")
         return
@@ -267,7 +268,10 @@ def get_cmd(msg):
 
         con = get_db()
         cur = con.cursor()
-        cur.execute("SELECT email,password,protocol,server,port FROM accounts WHERE email=%s", (email_addr,))
+        cur.execute("""
+            SELECT email,password,protocol,server,port 
+            FROM accounts WHERE email=%s
+        """, (email_addr,))
         row = cur.fetchone()
         con.close()
 
@@ -281,11 +285,10 @@ def get_cmd(msg):
         if not codes:
             bot.reply_to(msg, "⚠️ No OTP found.")
         else:
-            bot.reply_to(msg, "✅ Latest Codes:\n" + "\n".join(codes))
+            bot.reply_to(msg, f"✅ Latest OTP:\n<code>{codes[0]}</code>")
 
     except:
         bot.reply_to(msg, "Usage: /get email@example.com")
-
 
 # ================= WEBHOOK =================
 
@@ -296,7 +299,6 @@ def webhook_receive():
     bot.process_new_updates([update])
     return "OK", 200
 
-
 @app.route("/")
 def webhook_set():
     render_url = os.getenv("RENDER_EXTERNAL_URL")
@@ -304,7 +306,6 @@ def webhook_set():
     bot.remove_webhook()
     bot.set_webhook(url=webhook_url)
     return "Webhook Set", 200
-
 
 # ================= MAIN =================
 
