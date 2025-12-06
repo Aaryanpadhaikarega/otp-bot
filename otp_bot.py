@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import os
-import re
 import imaplib
 import poplib
 import email
@@ -19,12 +18,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_URL = os.getenv("DATABASE_URL", "").strip()
 
-if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN missing")
-if not ADMIN_ID:
-    raise SystemExit("❌ ADMIN_ID missing")
-if not DB_URL:
-    raise SystemExit("❌ DATABASE_URL missing")
+if not BOT_TOKEN or not ADMIN_ID or not DB_URL:
+    raise SystemExit("❌ Missing env variables")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
@@ -72,7 +67,7 @@ class Account:
     server: str
     port: int
 
-# ================= ADMIN HELPERS =================
+# ================= ACCESS =================
 
 def is_admin(uid: int) -> bool:
     return uid == ADMIN_ID
@@ -100,111 +95,67 @@ def has_email_access(uid: int, email_addr: str) -> bool:
         return False
     return datetime.utcnow() < row[0]
 
-# ================= ✅ FRIEND’S WORKING OTP LOGIC =================
+# ================= EMAIL FETCH =================
 
-def find_signin_code(body):
-    patterns = [
-        r"\n\s*(\d{4})\s*\n",
-        r"^\s*(\d{4})\s*$",
-        r"(?:code|código|codice|codigo|codice|entry|enter)[^0-9]*(\d{4})",
-        r"\b(\d{4})\b"
-    ]
+def fetch_full_mail(acc: Account) -> List[str]:
+    messages = []
 
-    body = re.sub(r"<.*?>", " ", body)
-    body = re.sub(r"\s+", " ", body)
-
-    # ✅ Convert spaced digits → 1 8 0 0 → 1800
-    body = re.sub(r"(\d)\s+(\d)\s+(\d)\s+(\d)", r"\1\2\3\4", body)
-
-    for pat in patterns:
-        matches = re.findall(pat, body, flags=re.IGNORECASE | re.MULTILINE)
-        for match in matches:
-            code = match if isinstance(match, str) else match[0]
-            if len(code) == 4 and code.isdigit():
-                # ✅ Block years
-                if not re.match(r"19\d\d|20\d\d", code):
-                    return code
-    return None
-
-def is_netflix_signin_email(subject, body_lower):
-    if "netflix" not in subject and "netflix" not in body_lower:
-        return False
-
-    signin_indicators = [
-        "code", "enter", "sign in", "signin",
-        "device", "dispositivo", "appareil"
-    ]
-
-    has_indicator = any(i in subject or i in body_lower for i in signin_indicators)
-    has_code = bool(re.search(r"\b\d{4}\b", body_lower))
-
-    return has_indicator and has_code
-
-def extract_body(msg):
-    text = ""
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() in ("text/plain", "text/html"):
-                payload = part.get_payload(decode=True)
-                if payload:
-                    text += payload.decode(errors="ignore") + "\n"
-    else:
-        payload = msg.get_payload(decode=True)
-        if payload:
-            text = payload.decode(errors="ignore")
-    return text
-
-# ================= ✅ EMAIL FETCH =================
-
-def fetch_signin_code(acc: Account) -> List[str]:
     try:
+        # ---------- IMAP ----------
         if acc.protocol == "imap":
             imap = imaplib.IMAP4_SSL(acc.server, acc.port)
             imap.login(acc.email, acc.password)
             imap.select("inbox")
 
             _, data = imap.search(None, "ALL")
-            ids = data[0].split()
+            ids = data[0].split()[-3:]  # last 3 emails only
 
-            for eid in reversed(ids[-15:]):  # ✅ newest first
+            for eid in ids:
                 _, msg_data = imap.fetch(eid, "(RFC822)")
-                msg = email.message_from_bytes(msg_data[0][1], policy=policy.default)
+                raw = msg_data[0][1]
 
-                subject = (msg["subject"] or "").lower()
-                body = extract_body(msg)
-                body_lower = body.lower()
+                msg = email.message_from_bytes(raw, policy=policy.default)
 
-                if is_netflix_signin_email(subject, body_lower):
-                    code = find_signin_code(body)
-                    if code:
-                        imap.logout()
-                        return [code]
+                subject = str(msg["subject"])
+                messages.append(f"\n===== SUBJECT =====\n{subject}\n")
+
+                full_text = ""
+
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() in ("text/plain", "text/html"):
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                full_text += payload.decode(errors="ignore") + "\n"
+                else:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        full_text = payload.decode(errors="ignore")
+
+                messages.append(full_text)
 
             imap.logout()
 
-        else:  # ✅ POP3
+        # ---------- POP3 ----------
+        else:
             pop = poplib.POP3_SSL(acc.server, acc.port)
             pop.user(acc.email)
             pop.pass_(acc.password)
 
             count, _ = pop.stat()
+            start = max(1, count - 2)
 
-            for i in range(count, max(1, count - 15), -1):
+            for i in range(count, start - 1, -1):
                 _, lines, _ = pop.retr(i)
                 text = b"\n".join(lines).decode(errors="ignore")
-
-                if is_netflix_signin_email("", text.lower()):
-                    code = find_signin_code(text)
-                    if code:
-                        pop.quit()
-                        return [code]
+                messages.append(text)
 
             pop.quit()
 
     except Exception as e:
-        print("EMAIL ERROR:", e)
+        return [f"EMAIL ERROR: {e}"]
 
-    return []
+    return messages
 
 # ================= BOT COMMANDS =================
 
@@ -219,61 +170,52 @@ def start_cmd(msg):
 def approve_cmd(msg):
     if not is_admin(msg.from_user.id):
         return
-    try:
-        uid = int(msg.text.split()[1])
-        con = get_db()
-        cur = con.cursor()
-        cur.execute("INSERT INTO approved_users(user_id) VALUES(%s) ON CONFLICT DO NOTHING", (uid,))
-        con.commit()
-        con.close()
-        bot.reply_to(msg, "✅ User approved.")
-    except:
-        bot.reply_to(msg, "Usage: /approve 123456")
+    uid = int(msg.text.split()[1])
+    con = get_db()
+    cur = con.cursor()
+    cur.execute("INSERT INTO approved_users(user_id) VALUES(%s) ON CONFLICT DO NOTHING", (uid,))
+    con.commit()
+    con.close()
+    bot.reply_to(msg, "✅ User approved.")
 
 @bot.message_handler(commands=["add"])
 def add_account_cmd(msg):
     if not is_admin(msg.from_user.id):
         return
-    try:
-        _, email_addr, password, protocol, server, port = msg.text.split()
-        con = get_db()
-        cur = con.cursor()
-        cur.execute("""
-            INSERT INTO accounts(email,password,protocol,server,port)
-            VALUES(%s,%s,%s,%s,%s)
-            ON CONFLICT (email)
-            DO UPDATE SET
-                password=EXCLUDED.password,
-                protocol=EXCLUDED.protocol,
-                server=EXCLUDED.server,
-                port=EXCLUDED.port
-        """, (email_addr, password, protocol, server, int(port)))
-        con.commit()
-        con.close()
-        bot.reply_to(msg, "✅ Account saved.")
-    except:
-        bot.reply_to(msg, "Usage:\n/add email pass imap mail.server.com 993")
+    _, email_addr, password, protocol, server, port = msg.text.split()
+    con = get_db()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO accounts(email,password,protocol,server,port)
+        VALUES(%s,%s,%s,%s,%s)
+        ON CONFLICT (email)
+        DO UPDATE SET
+            password=EXCLUDED.password,
+            protocol=EXCLUDED.protocol,
+            server=EXCLUDED.server,
+            port=EXCLUDED.port
+    """, (email_addr, password, protocol, server, int(port)))
+    con.commit()
+    con.close()
+    bot.reply_to(msg, "✅ Account saved.")
 
 @bot.message_handler(commands=["grant"])
 def grant_cmd(msg):
     if not is_admin(msg.from_user.id):
         return
-    try:
-        _, uid, email_addr, days = msg.text.split()
-        expires = datetime.utcnow() + timedelta(days=int(days))
-        con = get_db()
-        cur = con.cursor()
-        cur.execute("""
-            INSERT INTO user_email_access(user_id,email,expires_at)
-            VALUES(%s,%s,%s)
-            ON CONFLICT (user_id,email)
-            DO UPDATE SET expires_at=EXCLUDED.expires_at
-        """, (int(uid), email_addr, expires))
-        con.commit()
-        con.close()
-        bot.reply_to(msg, f"✅ Access granted for {days} days.")
-    except:
-        bot.reply_to(msg, "Usage: /grant 123456 email@example.com 7")
+    _, uid, email_addr, days = msg.text.split()
+    expires = datetime.utcnow() + timedelta(days=int(days))
+    con = get_db()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO user_email_access(user_id,email,expires_at)
+        VALUES(%s,%s,%s)
+        ON CONFLICT (user_id,email)
+        DO UPDATE SET expires_at=EXCLUDED.expires_at
+    """, (int(uid), email_addr, expires))
+    con.commit()
+    con.close()
+    bot.reply_to(msg, "✅ Access granted.")
 
 @bot.message_handler(commands=["get"])
 def get_cmd(msg):
@@ -283,33 +225,35 @@ def get_cmd(msg):
         bot.reply_to(msg, "❌ Not approved.")
         return
 
-    try:
-        email_addr = msg.text.split()[1]
+    email_addr = msg.text.split()[1]
 
-        if not has_email_access(uid, email_addr):
-            bot.reply_to(msg, "❌ No access to this email.")
-            return
+    if not has_email_access(uid, email_addr):
+        bot.reply_to(msg, "❌ No access to this email.")
+        return
 
-        con = get_db()
-        cur = con.cursor()
-        cur.execute("SELECT email,password,protocol,server,port FROM accounts WHERE email=%s", (email_addr,))
-        row = cur.fetchone()
-        con.close()
+    con = get_db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT email,password,protocol,server,port 
+        FROM accounts WHERE email=%s
+    """, (email_addr,))
+    row = cur.fetchone()
+    con.close()
 
-        if not row:
-            bot.reply_to(msg, "❌ Email not found.")
-            return
+    if not row:
+        bot.reply_to(msg, "❌ Email not found.")
+        return
 
-        acc = Account(*row)
-        codes = fetch_signin_code(acc)
+    acc = Account(*row)
+    mails = fetch_full_mail(acc)
 
-        if not codes:
-            bot.reply_to(msg, "⚠️ No OTP found.")
-        else:
-            bot.reply_to(msg, f"✅ Netflix OTP:\n<code>{codes[0]}</code>")
+    if not mails:
+        bot.reply_to(msg, "⚠️ No mails found.")
+        return
 
-    except:
-        bot.reply_to(msg, "Usage: /get email@example.com")
+    for mail in mails:
+        for i in range(0, len(mail), 3800):
+            bot.send_message(msg.chat.id, mail[i:i+3800])
 
 # ================= WEBHOOK =================
 
