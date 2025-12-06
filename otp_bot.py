@@ -103,24 +103,30 @@ def has_email_access(uid: int, email_addr: str) -> bool:
 # ================= OTP DETECTOR =================
 
 def find_signin_code(body):
+    body = body.lower()
+
+    # STRONG keyword-based patterns ONLY
     patterns = [
-        r"\n\s*(\d{4})\s*\n",
-        r"^\s*(\d{4})\s*$",
-        r"(?:code|código|codice|otp|verification|sign in)[^0-9]{0,10}(\d{4})",
-        r"\b(\d{4})\b"
+        r"(?:code|otp|verification|verify|sign in|signin)[^0-9]{0,15}(\d{4})",
+        r"use[^0-9]{0,15}(\d{4})[^0-9]{0,10}(?:to|for)?[^a-z]{0,5}(?:sign|login)",
+        r"your[^a-z]{0,10}(?:code|otp)[^0-9]{0,10}(\d{4})",
     ]
 
     for pat in patterns:
         matches = re.findall(pat, body, flags=re.IGNORECASE)
-        for match in matches:
-            code = match if isinstance(match, str) else match[0]
-
+        for code in matches:
             if len(code) == 4 and code.isdigit():
-                pos = body.find(code)
-                nearby = body[max(0, pos-10): pos+14]
+                
+                # ❌ HARD FILTERS — these BLOCK YEARS, DATES, RANGES
+                if (
+                    1900 <= int(code) <= 2099  # blocks years
+                    or re.search(r"\d{4}[-/.]\d{1,2}", body)  # date like 2025-12
+                    or re.search(r"\d{4}/\d{4}", body)        # range like 1234/5678
+                ):
+                    continue
 
-                if not re.search(r"\d{4}[-/.]\d{4}", nearby):
-                    return code
+                return code
+
     return None
 
 # ================= EMAIL FETCH =================
