@@ -103,21 +103,9 @@ def has_email_access(uid: int, email_addr: str) -> bool:
 # ================= OTP DETECTOR =================
 
 def find_signin_code(body):
-    body = body.replace("\r", "")
-
-    # ✅ NETFLIX FORMAT (OTP ON NEXT LINE)
-    match = re.search(
-        r"enter this code to sign in\s*\n\s*((?:\d\s*){4})",
-        body,
-        re.IGNORECASE
-    )
-
+    match = re.search(r"(\d{4})", body)
     if match:
-        raw = match.group(1)
-        code = re.sub(r"\s+", "", raw)
-        if code.isdigit() and len(code) == 4:
-            return code
-
+        return match.group(1)
     return None
 
 
