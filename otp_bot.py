@@ -105,29 +105,36 @@ def has_email_access(uid: int, email_addr: str) -> bool:
 def find_signin_code(body):
     body = body.lower()
 
-    # STRONG keyword-based patterns ONLY
     patterns = [
-        r"(?:code|otp|verification|verify|sign in|signin)[^0-9]{0,15}(\d{4})",
-        r"use[^0-9]{0,15}(\d{4})[^0-9]{0,10}(?:to|for)?[^a-z]{0,5}(?:sign|login)",
-        r"your[^a-z]{0,10}(?:code|otp)[^0-9]{0,10}(\d{4})",
+        # code 1 2 3 4
+        r"(?:code|otp|verification|verify|sign in|signin)[^0-9]{0,20}((?:\d\s*){4})",
+
+        # use 1 2 3 4 to sign in
+        r"use[^0-9]{0,20}((?:\d\s*){4})[^a-z]{0,10}(?:to|for)?[^a-z]{0,5}(?:sign|login)"
     ]
 
     for pat in patterns:
         matches = re.findall(pat, body, flags=re.IGNORECASE)
-        for code in matches:
-            if len(code) == 4 and code.isdigit():
-                
-                # ❌ HARD FILTERS — these BLOCK YEARS, DATES, RANGES
-                if (
-                    1900 <= int(code) <= 2099  # blocks years
-                    or re.search(r"\d{4}[-/.]\d{1,2}", body)  # date like 2025-12
-                    or re.search(r"\d{4}/\d{4}", body)        # range like 1234/5678
-                ):
-                    continue
+        for raw in matches:
+            code = re.sub(r"\s+", "", raw)  # remove spaces
 
-                return code
+            if not code.isdigit() or len(code) != 4:
+                continue
+
+            num = int(code)
+
+            # ❌ HARD BLOCK: years & dates
+            if 1900 <= num <= 2099:
+                continue
+            if re.search(r"\d{4}[-/.]\d{1,2}", body):
+                continue
+            if re.search(r"\d{4}/\d{4}", body):
+                continue
+
+            return code
 
     return None
+
 
 # ================= EMAIL FETCH =================
 
